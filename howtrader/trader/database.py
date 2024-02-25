@@ -35,6 +35,19 @@ class BarOverview:
     end: datetime = None
 
 
+@dataclass
+class TickOverview:
+    """
+    Overview of tick data stored in database.
+    """
+
+    symbol: str = ""
+    exchange: Exchange = None
+    count: int = 0
+    start: datetime = None
+    end: datetime = None
+
+
 class BaseDatabase(ABC):
     """
     Abstract database class for connecting to different database.
@@ -56,12 +69,12 @@ class BaseDatabase(ABC):
 
     @abstractmethod
     def load_bar_data(
-        self,
-        symbol: str,
-        exchange: Exchange,
-        interval: Interval,
-        start: datetime,
-        end: datetime
+            self,
+            symbol: str,
+            exchange: Exchange,
+            interval: Interval,
+            start: datetime,
+            end: datetime
     ) -> List[BarData]:
         """
         Load bar data from database.
@@ -70,11 +83,11 @@ class BaseDatabase(ABC):
 
     @abstractmethod
     def load_tick_data(
-        self,
-        symbol: str,
-        exchange: Exchange,
-        start: datetime,
-        end: datetime
+            self,
+            symbol: str,
+            exchange: Exchange,
+            start: datetime,
+            end: datetime
     ) -> List[TickData]:
         """
         Load tick data from database.
@@ -83,10 +96,10 @@ class BaseDatabase(ABC):
 
     @abstractmethod
     def delete_bar_data(
-        self,
-        symbol: str,
-        exchange: Exchange,
-        interval: Interval
+            self,
+            symbol: str,
+            exchange: Exchange,
+            interval: Interval
     ) -> int:
         """
         Delete all bar data with given symbol + exchange + interval.
@@ -95,9 +108,9 @@ class BaseDatabase(ABC):
 
     @abstractmethod
     def delete_tick_data(
-        self,
-        symbol: str,
-        exchange: Exchange
+            self,
+            symbol: str,
+            exchange: Exchange
     ) -> int:
         """
         Delete all tick data with given symbol + exchange.
@@ -133,6 +146,9 @@ def get_database() -> BaseDatabase:
 
     elif database_name == 'mongo':
         from howtrader.trader.dbconnectors import MongodbDatabase as Database
+
+    elif database_name == 'postgresql':
+        from howtrader.trader.dbconnectors import PostgresqlDatabase as Database
 
     else:
         raise Exception("database.name in settings should be one of mysql、sqlite、mongo")
