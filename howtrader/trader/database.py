@@ -151,7 +151,7 @@ def get_database() -> BaseDatabase:
         from howtrader.trader.dbconnectors import PostgresqlDatabase as Database
 
     else:
-        raise Exception("database.name in settings should be one of mysql、sqlite、mongo")
+        raise Exception("database.name in settings should be one of mysql、sqlite、mongo、postgresql")
 
     database = Database()
     return database
