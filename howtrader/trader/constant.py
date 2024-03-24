@@ -84,6 +84,7 @@ class Exchange(Enum):
     Exchange.
     """
     # CryptoCurrency
+    MT5 = "MT5"
     FTX = "FTX"
     OKX = "OKX"  # previous OKEX
     BITFINEX = "BITFINEX"
