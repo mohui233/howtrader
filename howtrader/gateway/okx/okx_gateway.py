@@ -2,23 +2,28 @@
 1. 只支持单币种保证金模式
 2. 只支持全仓模式
 3. 只支持单向持仓模式
-
 """
 
+
 import base64
-import decimal
-from decimal import Decimal
 import hashlib
 import hmac
 import json
 import sys
 import time
 from copy import copy
-from datetime import datetime, timedelta
+from datetime import datetime
 from urllib.parse import urlencode
 from typing import Any, Dict, List, Set
 from types import TracebackType
 
+from howtrader.api.websocket import WebsocketClient
+
+from howtrader.api.rest import RestClient, Request
+from requests import Response
+from pytz import timezone
+
+from howtrader.event.engine import EventEngine
 from howtrader.trader.constant import (
     Direction,
     Exchange,
@@ -26,9 +31,11 @@ from howtrader.trader.constant import (
     Offset,
     OrderType,
     Product,
-    Status
+    Status,
+    OptionType
 )
 from howtrader.trader.gateway import BaseGateway
+from howtrader.trader.utility import round_to
 from howtrader.trader.object import (
     AccountData,
     BarData,
@@ -39,25 +46,28 @@ from howtrader.trader.object import (
     OrderRequest,
     PositionData,
     SubscribeRequest,
-    OrderQueryRequest,
     TickData,
     TradeData
 )
+# from vnpy_rest import Request, RestClient
+# from vnpy_websocket import WebsocketClient
 
-from howtrader.api.rest import RestClient, Request, Response
-from howtrader.api.websocket import WebsocketClient
-from howtrader.trader.constant import LOCAL_TZ
-from howtrader.trader.event import EVENT_TIMER
-from howtrader.event import Event, EventEngine
-from howtrader.trader.setting import SETTINGS
 
+# 中国时区
+CHINA_TZ: timezone = timezone("Asia/Shanghai")
+
+# 实盘和模拟盘REST API地址
 REST_HOST: str = "https://www.okx.com"
+
+# 实盘Websocket API地址
 PUBLIC_WEBSOCKET_HOST: str = "wss://ws.okx.com:8443/ws/v5/public"
 PRIVATE_WEBSOCKET_HOST: str = "wss://ws.okx.com:8443/ws/v5/private"
+
+# 模拟盘Websocket API地址
 TEST_PUBLIC_WEBSOCKET_HOST: str = "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
 TEST_PRIVATE_WEBSOCKET_HOST: str = "wss://wspap.okx.com:8443/ws/v5/private?brokerId=9999"
 
-# Order status mapping
+# 委托状态映射
 STATUS_OKX2VT: Dict[str, Status] = {
     "live": Status.NOTTRADED,
     "partially_filled": Status.PARTTRADED,
@@ -65,65 +75,68 @@ STATUS_OKX2VT: Dict[str, Status] = {
     "canceled": Status.CANCELLED
 }
 
-# order type mapping.
+# 委托类型映射
 ORDERTYPE_OKX2VT: Dict[str, OrderType] = {
     "limit": OrderType.LIMIT,
     "fok": OrderType.FOK,
-    "ioc": OrderType.FAK,
-    "market": OrderType.TAKER,
-    "post_only": OrderType.MAKER,
+    "ioc": OrderType.FAK
 }
 ORDERTYPE_VT2OKX: Dict[OrderType, str] = {v: k for k, v in ORDERTYPE_OKX2VT.items()}
 
-# order side mapping.
+# 买卖方向映射
 DIRECTION_OKX2VT: Dict[str, Direction] = {
     "buy": Direction.LONG,
     "sell": Direction.SHORT
 }
 DIRECTION_VT2OKX: Dict[Direction, str] = {v: k for k, v in DIRECTION_OKX2VT.items()}
 
-# interval/timeframe mapping.
+# 数据频率映射
 INTERVAL_VT2OKX: Dict[Interval, str] = {
     Interval.MINUTE: "1m",
     Interval.HOUR: "1H",
     Interval.DAILY: "1D",
 }
 
-# product mapping.
+# 产品类型映射
 PRODUCT_OKX2VT: Dict[str, Product] = {
-    "SPOT": Product.SPOT,   # spot
-    "SWAP": Product.FUTURES,  # swap
-    "FUTURES": Product.FUTURES,  # futures
-    # "MARGIN": Product.SPOT,  # margin
+    "SWAP": Product.FUTURES,
+    "SPOT": Product.SPOT,
+    "FUTURES": Product.FUTURES,
+    "OPTION": Product.OPTION
 }
 PRODUCT_VT2OKX: Dict[Product, str] = {v: k for k, v in PRODUCT_OKX2VT.items()}
 
-# symbol/instrument mapping.
+# 期权类型映射
+OPTIONTYPE_OKXO2VT: Dict[str, OptionType] = {
+    "C": OptionType.CALL,
+    "P": OptionType.PUT
+}
+
+# 合约数据全局缓存字典
 symbol_contract_map: Dict[str, ContractData] = {}
 
-# local order set
+# 本地委托号缓存集合
 local_orderids: Set[str] = set()
 
 
 class OkxGateway(BaseGateway):
     """
-    howtrader OKX gateway
+    vn.py用于对接OKX统一账户的交易接口。
     """
 
-    default_name = "OKX"
-
     default_setting: Dict[str, Any] = {
-        "key": "",
-        "secret": "",
-        "passphrase": "",
-        "proxy_host": "",
-        "proxy_port": 0,
-        "server": ["REAL", "TEST"]
+        "API Key": "",
+        "Secret Key": "",
+        "Passphrase": "",
+        "代理地址": "",
+        "代理端口": "",
+        "服务器": ["REAL", "TEST"]
     }
-
+    default_name = "OKX"
     exchanges: Exchange = [Exchange.OKX]
 
     def __init__(self, event_engine: EventEngine, gateway_name: str = "OKX") -> None:
+        """构造函数"""
         super().__init__(event_engine, gateway_name)
 
         self.rest_api: "OkxRestApi" = OkxRestApi(self)
@@ -131,24 +144,20 @@ class OkxGateway(BaseGateway):
         self.ws_private_api: "OkxWebsocketPrivateApi" = OkxWebsocketPrivateApi(self)
 
         self.orders: Dict[str, OrderData] = {}
-        self.get_server_time_interval: int = 0
 
     def connect(self, setting: dict) -> None:
-        """connect to OKX"""
-        key: str = setting["key"]
-        secret: str = setting["secret"]
-        passphrase: str = setting["passphrase"]
-        server: str = setting["server"]
+        """连接交易接口"""
+        key: str = setting["API Key"]
+        secret: str = setting["Secret Key"]
+        passphrase: str = setting["Passphrase"]
+        proxy_host: str = setting["代理地址"]
+        proxy_port: str = setting["代理端口"]
+        server: str = setting["服务器"]
 
-        if not setting["proxy_host"] and isinstance(setting["proxy_host"], str):
-            proxy_host: str = setting["proxy_host"]
+        if proxy_port.isdigit():
+            proxy_port = int(proxy_port)
         else:
-            proxy_host: str = ""
-
-        try:
-            proxy_port: int = int(setting["proxy_port"])
-        except ValueError:
-            proxy_port: int = 0
+            proxy_port = 0
 
         self.rest_api.connect(
             key,
@@ -172,91 +181,51 @@ class OkxGateway(BaseGateway):
             server
         )
 
-        self.event_engine.unregister(EVENT_TIMER, self.process_timer_event)
-        self.event_engine.register(EVENT_TIMER, self.process_timer_event)
-
-    def process_timer_event(self, event: Event) -> None:
-        """process the server time update."""
-        self.get_server_time_interval += 1
-        if self.get_server_time_interval >= SETTINGS.get('update_server_time_interval', 300):
-            self.rest_api.query_time()
-            self.get_server_time_interval = 0
-
     def subscribe(self, req: SubscribeRequest) -> None:
-        """subscribe to market data."""
+        """订阅行情"""
         self.ws_public_api.subscribe(req)
 
     def send_order(self, req: OrderRequest) -> str:
-        """send order through private websocket."""
+        """委托下单"""
         return self.ws_private_api.send_order(req)
 
-    def query_order(self, req: OrderQueryRequest) -> None:
-        """query order status, you can get the order status in on_order method"""
-        self.rest_api.query_order(req)
-
     def cancel_order(self, req: CancelRequest) -> None:
-        """cancel order through private websocket."""
+        """委托撤单"""
         self.ws_private_api.cancel_order(req)
 
     def query_account(self) -> None:
-        """query account."""
+        """查询资金"""
         pass
 
     def query_position(self) -> None:
-        """query position."""
+        """查询持仓"""
         pass
 
     def query_history(self, req: HistoryRequest) -> List[BarData]:
-        """query history kline/candles"""
+        """查询历史数据"""
         return self.rest_api.query_history(req)
 
     def close(self) -> None:
-        """close api"""
+        """关闭连接"""
         self.rest_api.stop()
         self.ws_public_api.stop()
         self.ws_private_api.stop()
 
     def on_order(self, order: OrderData) -> None:
-        """on order update"""
-        last_order: OrderData = self.get_order(order.orderid)
-        if not last_order:
-            self.orders[order.orderid] = order
-            super().on_order(copy(order))
-
-        else:
-            traded: Decimal = order.traded - last_order.traded
-            if traded < 0:  # filter the order is not in sequence
-                return None
-
-            if traded > 0:
-                trade: TradeData = TradeData(
-                    symbol=order.symbol,
-                    exchange=order.exchange,
-                    orderid=order.orderid,
-                    direction=order.direction,
-                    price=order.traded_price,
-                    volume=traded,
-                    datetime=order.update_time,
-                    gateway_name=self.gateway_name,
-                )
-
-                super().on_trade(trade)
-
-            if traded == 0 and order.status == last_order.status:
-                return None
-
-            self.orders[order.orderid] = order
-            super().on_order(copy(order))
+        """推送委托数据"""
+        self.orders[order.orderid] = order  # 先做一次缓存
+        super().on_order(order)
 
     def get_order(self, orderid: str) -> OrderData:
-        """get order."""
+        """查询委托数据"""
         return self.orders.get(orderid, None)
 
 
 class OkxRestApi(RestClient):
-    """OKX rest api..."""
+    """"""
 
     def __init__(self, gateway: OkxGateway) -> None:
+        """构造函数"""
         super().__init__()
 
         self.gateway: OkxGateway = gateway
@@ -266,14 +235,11 @@ class OkxRestApi(RestClient):
         self.secret: str = ""
         self.passphrase: str = ""
         self.simulated: bool = False
-        self.time_offset_ms: float = 0
 
     def sign(self, request: Request) -> Request:
-        """signature"""
-
-        now: datetime = datetime.utcnow()
-        now = now - timedelta(milliseconds=self.time_offset_ms)
-        timestamp: str = now.isoformat("T", "milliseconds") + "Z"
+        """生成欧易V5签名"""
+        # 签名
+        timestamp: str = generate_timestamp()
         request.data = json.dumps(request.data)
 
         if request.params:
@@ -284,7 +250,7 @@ class OkxRestApi(RestClient):
         msg: str = timestamp + request.method + path + request.data
         signature: bytes = generate_signature(msg, self.secret)
 
-        # request headers for private api
+        # 添加请求头
         request.headers = {
             "OK-ACCESS-KEY": self.key,
             "OK-ACCESS-SIGN": signature.decode(),
@@ -307,125 +273,79 @@ class OkxRestApi(RestClient):
         proxy_port: int,
         server: str
     ) -> None:
-        """connect rest api"""
+        """连接REST服务器"""
         self.key = key
         self.secret = secret.encode()
         self.passphrase = passphrase
-        self.connect_time = int(datetime.now().strftime("%y%m%d%H%M%S"))
 
         if server == "TEST":
             self.simulated = True
 
+        self.connect_time = int(datetime.now().strftime("%y%m%d%H%M%S"))
+
         self.init(REST_HOST, proxy_host, proxy_port)
         self.start()
-        self.gateway.write_log("starting rest api")
+        self.gateway.write_log("REST API启动成功")
 
         self.query_time()
-        self.query_open_orders()
-        self.query_instrument()
-        self.set_position_mode()
+        self.query_order()
+        for instType in ["SPOT", "SWAP", "FUTURES"]:
+            self.query_instruments(instType)
 
-    def set_position_mode(self) -> None:
-        self.add_request(
-            "POST",
-            "/api/v5/account/set-position-mode",
-            data={"posMode": "net_mode"},
-            callback=self.on_position_mode)
-
-    def on_position_mode(self, packet: dict, request: Request):
-        pass
-
-    def query_open_orders(self) -> None:
-        """query open orders"""
+    def query_order(self) -> None:
+        """查询未成交委托"""
         self.add_request(
             "GET",
             "/api/v5/trade/orders-pending",
-            callback=self.on_query_open_orders,
+            callback=self.on_query_order,
         )
 
     def query_time(self) -> None:
-        """query server time"""
+        """查询时间"""
         self.add_request(
             "GET",
             "/api/v5/public/time",
             callback=self.on_query_time
         )
 
-    def query_order(self, req: OrderQueryRequest) -> None:
-        params = {
-            "instId": req.symbol
-        }
-
-        if req.orderid in local_orderids:
-            params["clOrdId"] = req.orderid
-        else:
-            params["ordId"] = req.orderid
-
+    def query_instruments(self, instType) -> None:
         self.add_request(
             "GET",
-            "/api/v5/trade/order",
-            params=params,
-            callback=self.on_query_order,
+            "/api/v5/public/instruments",
+            callback=self.on_query_instruments,
+            params={"instType": instType}
         )
 
     def on_query_order(self, packet: dict, request: Request) -> None:
-        # print("query order by restapi: ")
-        # print(packet)
-
-        order_datas = packet.get('data', [])
-        for order_info in order_datas:
+        """未成交委托查询回报"""
+        for order_info in packet["data"]:
             order: OrderData = parse_order_data(
                 order_info,
                 self.gateway_name
             )
             self.gateway.on_order(order)
 
-        self.gateway.write_log("query order successfully.")
-
-    def on_query_open_orders(self, packet: dict, request: Request) -> None:
-        """on query open orders successfully callback"""
-        order_datas = packet.get('data', [])
-        for order_info in order_datas:
-            order: OrderData = parse_order_data(
-                order_info,
-                self.gateway_name
-            )
-            self.gateway.on_order(order)
-
-        self.gateway.write_log("query open orders successfully.")
-
-    def query_instrument(self) -> None:
-        """query symbols/instruments"""
-        for inst_type in PRODUCT_OKX2VT.keys():
-            self.add_request(
-                "GET",
-                "/api/v5/public/instruments",
-                callback=self.on_query_instrument,
-                params={"instType": inst_type}
-            )
+        self.gateway.write_log("委托信息查询成功")
 
     def on_query_time(self, packet: dict, request: Request) -> None:
-        server_ts: float = float(packet["data"][0]["ts"])
-        local_ts: float = float(time.time() * 1000)
-        self.time_offset_ms: float = local_ts - server_ts
-
-        server_dt: datetime = datetime.fromtimestamp(server_ts / 1000)
-        local_dt: datetime = datetime.fromtimestamp(local_ts/1000)
-        msg: str = f"server time: {server_dt}, local time: {local_dt}"
+        """时间查询回报"""
+        timestamp: int = int(packet["data"][0]["ts"])
+        server_time: datetime = datetime.fromtimestamp(timestamp / 1000)
+        local_time: datetime = datetime.now()
+        msg: str = f"服务器时间：{server_time}，本机时间：{local_time}"
         self.gateway.write_log(msg)
 
-    def on_query_instrument(self, packet: dict, request: Request) -> None:
-        """on query symbols/instruments"""
-        data: list = packet["data"]
-        for d in data:
-            symbol: str = d["instId"]
-            product: Product = PRODUCT_OKX2VT[d["instType"]]
+    def on_query_instruments(self, packet: dict, request: Request) -> None:
+        instType = ""
+        for instrument in packet['data']:
+            symbol: str = instrument["instId"]
+            product: Product = PRODUCT_OKX2VT[instrument["instType"]]
             net_position: bool = True
-
-            if not d["ctMult"]:
-                size: Decimal = Decimal("1")
+            instType = product
+            if product == Product.SPOT:
+                size: float = 1
             else:
-                size: Decimal = Decimal(d["ctMult"])
+                size: float = float(instrument["ctMult"])
 
             contract: ContractData = ContractData(
                 symbol=symbol,
@@ -433,19 +353,30 @@ class OkxRestApi(RestClient):
                 name=symbol,
                 product=product,
                 size=size,
-                pricetick=Decimal(d["tickSz"]),  # price
-                min_volume=Decimal(d["lotSz"]),  # volume precision
-                min_size=Decimal(d["minSz"]),
+                pricetick=float(instrument["tickSz"]),
+                min_volume=float(instrument["minSz"]),
                 history_data=True,
                 net_position=net_position,
                 gateway_name=self.gateway_name,
             )
 
+            # 处理期权相关信息
+            if product == Product.OPTION:
+                contract.option_strike = float(instrument["stk"])
+                contract.option_type = OPTIONTYPE_OKXO2VT[instrument["optType"]]
+                contract.option_expiry = datetime.fromtimestamp(int(instrument["expTime"]) / 1000)
+                contract.option_portfolio = instrument["uly"]
+                contract.option_index = instrument["stk"]
+                contract.option_underlying = "_".join([
+                    contract.option_portfolio,
+                    contract.option_expiry.strftime("%Y%m%d")
+                ])
+
+            # 缓存合约信息并推送
             symbol_contract_map[contract.symbol] = contract
             self.gateway.on_contract(contract)
 
-        if len(data):
-            self.gateway.write_log(f"query {d['instType']} market contract successfully.")
+        self.gateway.write_log(f"{instType}合约信息查询成功")
 
     def on_error(
         self,
@@ -454,8 +385,8 @@ class OkxRestApi(RestClient):
         tb: TracebackType,
         request: Request
     ) -> None:
-        """exception callback"""
-        msg: str = f"exception, code: {exception_type}, msg: {exception_value}"
+        """触发异常回报"""
+        msg: str = f"触发异常，状态码：{exception_type}，信息：{exception_value}"
         self.gateway.write_log(msg)
 
         sys.stderr.write(
@@ -463,28 +394,35 @@ class OkxRestApi(RestClient):
         )
 
     def query_history(self, req: HistoryRequest) -> List[BarData]:
-        """query kline/candles data"""
+        """
+        查询历史数据
+
+        K线数据每个粒度最多可获取最近1440条
+        """
         buf: Dict[datetime, BarData] = {}
-        end_time: str = str(int(req.end.timestamp()//60) * 60 * 1000)
-        start_ts: int = int(req.start.timestamp()//60) * 60 * 1000  # ts in millisecond
+        end_time: str = ""
         path: str = "/api/v5/market/candles"
 
-        while True:
+        for i in range(15):
+            # 创建查询参数
             params: dict = {
                 "instId": req.symbol,
-                "bar": INTERVAL_VT2OKX[req.interval],
-                "limit": 300,
-                "after": end_time
+                "bar": INTERVAL_VT2OKX[req.interval]
             }
 
+            if end_time:
+                params["after"] = end_time
+
+            # 从服务器获取响应
             resp: Response = self.request(
                 "GET",
                 path,
                 params=params
             )
 
+            # 如果请求失败则终止循环
             if resp.status_code // 100 != 2:
-                msg = f"request failed，code：{resp.status_code} msg：{resp.text}"
+                msg = f"获取历史数据失败，状态码：{resp.status_code}，信息：{resp.text}"
                 self.gateway.write_log(msg)
                 break
             else:
@@ -492,46 +430,48 @@ class OkxRestApi(RestClient):
 
                 if not data["data"]:
                     m = data["msg"]
-                    msg = f"request historical candles failed: {m}"
-                    self.gateway.write_log(msg)
+                    msg = f"获取历史数据为空，{m}"
                     break
 
                 for bar_list in data["data"]:
-                    ts, o, h, l, c, vol, _, _, confirmed = bar_list
-                    if confirmed:
-                        dt = parse_timestamp(ts)
-                        bar: BarData = BarData(
-                            symbol=req.symbol,
-                            exchange=req.exchange,
-                            datetime=dt,
-                            interval=req.interval,
-                            volume=float(vol),
-                            open_price=float(o),
-                            high_price=float(h),
-                            low_price=float(l),
-                            close_price=float(c),
-                            gateway_name=self.gateway_name
-                        )
-                        buf[bar.datetime] = bar
+                    ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm = bar_list
+                    dt = parse_timestamp(ts)
+                    bar: BarData = BarData(
+                        symbol=req.symbol,
+                        exchange=req.exchange,
+                        datetime=dt,
+                        interval=req.interval,
+                        volume=float(vol),
+                        open_price=float(o),
+                        high_price=float(h),
+                        low_price=float(l),
+                        close_price=float(c),
+                        gateway_name=self.gateway_name
+                    )
+                    buf[bar.datetime] = bar
 
                 begin: str = data["data"][-1][0]
                 end: str = data["data"][0][0]
-                end_time = begin
-                msg: str = f"request historical candles，{req.symbol} - {req.interval.value}，{parse_timestamp(begin)}" \
-                           f" - {parse_timestamp(end)}"
+                msg: str = f"获取历史数据成功，{req.symbol} - {req.interval.value}，{parse_timestamp(begin)} - {parse_timestamp(end)}"
                 self.gateway.write_log(msg)
-                if int(begin) < start_ts:
-                    break
+
+                # 更新结束时间
+                end_time = begin
 
         index: List[datetime] = list(buf.keys())
         index.sort()
+
         history: List[BarData] = [buf[i] for i in index]
         return history
 
 
 class OkxWebsocketPublicApi(WebsocketClient):
+    """"""
+
     def __init__(self, gateway: OkxGateway) -> None:
+        """构造函数"""
         super().__init__()
+
         self.gateway: OkxGateway = gateway
         self.gateway_name: str = gateway.gateway_name
 
@@ -540,7 +480,8 @@ class OkxWebsocketPublicApi(WebsocketClient):
 
         self.callbacks: Dict[str, callable] = {
             "tickers": self.on_ticker,
-            "books5": self.on_depth
+            "books5": self.on_depth,
+            "instruments": self.on_instrument
         }
 
     def connect(
@@ -549,28 +490,47 @@ class OkxWebsocketPublicApi(WebsocketClient):
         proxy_port: int,
         server: str
     ) -> None:
-        self.receive_timeout = 60
+        """连接Websocket公共频道"""
         if server == "REAL":
-            # ping interval should be less than 30
-            self.init(host=PUBLIC_WEBSOCKET_HOST, proxy_host=proxy_host, proxy_port=proxy_port, ping_interval=20)
+            self.init(PUBLIC_WEBSOCKET_HOST, proxy_host, proxy_port, 20)
         else:
-            self.init(host=TEST_PUBLIC_WEBSOCKET_HOST, proxy_host=proxy_host, proxy_port=proxy_port, ping_interval=20)
+            self.init(TEST_PUBLIC_WEBSOCKET_HOST, proxy_host, proxy_port, 20)
 
         self.start()
 
+    def query_contract(self) -> None:
+        """查询合约信息"""
+        # 生成现货、永续、期货、期权的查询请求
+        args: list = []
+        for inst_type in ["SPOT", "SWAP", "FUTURES", "OPTION"]:
+            args.append({
+                "channel": "instruments",
+                "instType": inst_type
+            })
+
+        # 发送查询请求
+        okx_req: dict = {
+            "op": "subscribe",
+            "args": args
+        }
+        self.send_packet(okx_req)
+
     def subscribe(self, req: SubscribeRequest) -> None:
-        """subscribe market data"""
+        """订阅行情"""
+        # 缓存订阅记录
         self.subscribed[req.vt_symbol] = req
 
+        # 创建TICK对象
         tick: TickData = TickData(
             symbol=req.symbol,
             exchange=req.exchange,
             name=req.symbol,
-            datetime=datetime.now(LOCAL_TZ),
+            datetime=datetime.now(CHINA_TZ),
             gateway_name=self.gateway_name,
         )
         self.ticks[req.symbol] = tick
 
+        # 发送订阅请求
         args: list = []
         for channel in ["tickers", "books5"]:
             args.append({
@@ -585,15 +545,20 @@ class OkxWebsocketPublicApi(WebsocketClient):
         self.send_packet(req)
 
     def on_connected(self) -> None:
-        self.gateway.write_log("OKX Websocket Public API connected")
+        """连接成功回报"""
+        self.gateway.write_log("Websocket Public API连接成功")
+
+        self.query_contract()
 
         for req in list(self.subscribed.values()):
             self.subscribe(req)
 
     def on_disconnected(self) -> None:
-        self.gateway.write_log("OKX Websocket Public API disconnected")
+        """连接断开回报"""
+        self.gateway.write_log("Websocket Public API连接断开")
 
     def on_packet(self, packet: dict) -> None:
+        """推送数据回报"""
         if "event" in packet:
             event: str = packet["event"]
             if event == "subscribe":
@@ -601,7 +566,7 @@ class OkxWebsocketPublicApi(WebsocketClient):
             elif event == "error":
                 code: str = packet["code"]
                 msg: str = packet["msg"]
-                self.gateway.write_log(f"Websocket Public API Exception, code：{code}, msg：{msg}")
+                self.gateway.write_log(f"Websocket Public API请求异常, 状态码：{code}, 信息：{msg}")
         else:
             channel: str = packet["arg"]["channel"]
             callback: callable = self.callbacks.get(channel, None)
@@ -611,16 +576,59 @@ class OkxWebsocketPublicApi(WebsocketClient):
                 callback(data)
 
     def on_error(self, exception_type: type, exception_value: Exception, tb) -> None:
-        """on error"""
-        msg: str = f"public channels raise exceptions, type: {exception_type}, msg: {exception_value}"
+        """触发异常回报"""
+        msg: str = f"公共频道触发异常，类型：{exception_type}，信息：{exception_value}"
         self.gateway.write_log(msg)
 
         sys.stderr.write(
             self.exception_detail(exception_type, exception_value, tb)
         )
 
+    def on_instrument(self, data: list) -> None:
+        """合约查询回报"""
+        for d in data:
+            # 提取信息生成合约对象
+            symbol: str = d["instId"]
+            product: Product = PRODUCT_OKX2VT[d["instType"]]
+            net_position: bool = True
+            if product == Product.SPOT:
+                size: float = 1
+            else:
+                size: float = float(d["ctMult"])
+
+            contract: ContractData = ContractData(
+                symbol=symbol,
+                exchange=Exchange.OKX,
+                name=symbol,
+                product=product,
+                size=size,
+                pricetick=float(d["tickSz"]),
+                min_volume=float(d["minSz"]),
+                history_data=True,
+                net_position=net_position,
+                gateway_name=self.gateway_name,
+            )
+
+            # 处理期权相关信息
+            if product == Product.OPTION:
+                contract.option_strike = float(d["stk"])
+                contract.option_type = OPTIONTYPE_OKXO2VT[d["optType"]]
+                contract.option_expiry = datetime.fromtimestamp(int(d["expTime"]) / 1000)
+                contract.option_portfolio = d["uly"]
+                contract.option_index = d["stk"]
+                contract.option_underlying = "_".join([
+                    contract.option_portfolio,
+                    contract.option_expiry.strftime("%Y%m%d")
+                ])
+
+            # 缓存合约信息并推送
+            symbol_contract_map[contract.symbol] = contract
+            self.gateway.on_contract(contract)
+
+        self.gateway.write_log(f"{d['instType']}合约信息查询成功")
+
     def on_ticker(self, data: list) -> None:
-        """on tick"""
+        """行情推送回报"""
         for d in data:
             tick: TickData = self.ticks[d["instId"]]
             tick.last_price = float(d["last"])
@@ -630,7 +638,7 @@ class OkxWebsocketPublicApi(WebsocketClient):
             tick.volume = float(d["vol24h"])
 
     def on_depth(self, data: list) -> None:
-        """on depth/orderbook"""
+        """盘口推送回报"""
         for d in data:
             tick: TickData = self.ticks[d["instId"]]
             bids: list = d["bids"]
@@ -651,9 +659,10 @@ class OkxWebsocketPublicApi(WebsocketClient):
 
 
 class OkxWebsocketPrivateApi(WebsocketClient):
-    """account websocket"""
+    """"""
 
     def __init__(self, gateway: OkxGateway) -> None:
+        """构造函数"""
         super().__init__()
 
         self.gateway: OkxGateway = gateway
@@ -688,45 +697,45 @@ class OkxWebsocketPrivateApi(WebsocketClient):
         proxy_port: int,
         server: str
     ) -> None:
+        """连接Websocket私有频道"""
         self.key = key
         self.secret = secret.encode()
         self.passphrase = passphrase
 
         self.connect_time = int(datetime.now().strftime("%y%m%d%H%M%S"))
-        self.receive_timeout = 60
+
         if server == "REAL":
-            # ping interval should be less than 30
-            self.init(host=PRIVATE_WEBSOCKET_HOST, proxy_host=proxy_host, proxy_port=proxy_port, ping_interval=20)
+            self.init(PRIVATE_WEBSOCKET_HOST, proxy_host, proxy_port, 20)
         else:
-            self.init(host=TEST_PRIVATE_WEBSOCKET_HOST, proxy_host=proxy_host, proxy_port=proxy_port, ping_interval=20)
+            self.init(TEST_PRIVATE_WEBSOCKET_HOST, proxy_host, proxy_port, 20)
 
         self.start()
 
     def on_connected(self) -> None:
-        """connected callback"""
-        self.gateway.write_log("Websocket Private API connected")
+        """连接成功回报"""
+        self.gateway.write_log("Websocket Private API连接成功")
         self.login()
 
     def on_disconnected(self) -> None:
-        """disconnected callback"""
-        self.gateway.write_log("Websocket Private API disconnected")
+        """连接断开回报"""
+        self.gateway.write_log("Websocket Private API连接断开")
 
     def on_packet(self, packet: dict) -> None:
-        """"""
+        """推送数据回报"""
         if "event" in packet:
             cb_name: str = packet["event"]
         elif "op" in packet:
             cb_name: str = packet["op"]
         else:
-            cb_name: str = packet.get("arg", {}).get("channel", "")
+            cb_name: str = packet["arg"]["channel"]
 
         callback: callable = self.callbacks.get(cb_name, None)
         if callback:
             callback(packet)
 
     def on_error(self, exception_type: type, exception_value: Exception, tb) -> None:
-        """on error callback"""
-        msg: str = f"private websocket exception, type: {exception_type}, msg: {exception_value}"
+        """触发异常回报"""
+        msg: str = f"私有频道触发异常，类型：{exception_type}，信息：{exception_value}"
         self.gateway.write_log(msg)
 
         sys.stderr.write(
@@ -734,77 +743,71 @@ class OkxWebsocketPrivateApi(WebsocketClient):
         )
 
     def on_api_error(self, packet: dict) -> None:
-        """on api error event"""
-        code: str = packet.get("code", "")
-        msg: str = packet.get("msg", "")
-        self.gateway.write_log(f"Websocket Private API request failed, code: {code}, msg: {msg}")
+        """用户登录请求回报"""
+        code: str = packet["code"]
+        msg: str = packet["msg"]
+        self.gateway.write_log(f"Websocket Private API请求失败, 状态码：{code}, 信息：{msg}")
 
     def on_login(self, packet: dict) -> None:
-        """"""
-        if packet.get("code", None) == '0':
-            self.gateway.write_log("Websocket Private API login successfully.")
+        """用户登录请求回报"""
+        if packet["code"] == '0':
+            self.gateway.write_log("Websocket Private API登录成功")
             self.subscribe_topic()
         else:
-            self.gateway.write_log("Websocket Private API login failed.")
+            self.gateway.write_log("Websocket Private API登录失败")
 
     def on_order(self, packet: dict) -> None:
-        """on order"""
-        data: list = packet.get("data", [])
+        """委托更新推送"""
+        data: list = packet["data"]
         for d in data:
             order: OrderData = parse_order_data(d, self.gateway_name)
-            if order.type == OrderType.TAKER and order.status == Status.ALLTRADED and d.get("fillSz") == "0":
-                order.traded = order.volume
-
             self.gateway.on_order(order)
 
-            # if d["fillSz"] == "0":
-            #     return None
-            # # 这里处理的数据不对，需要进行处理....
-            # # 将成交数量四舍五入到正确精度
-            # trade_volume: float = float(d["fillSz"])
-            # contract: ContractData = symbol_contract_map.get(order.symbol, None)
-            # if contract:
-            #     trade_volume = round_to(trade_volume, contract.min_volume)
-            #
-            # trade: TradeData = TradeData(
-            #     symbol=order.symbol,
-            #     exchange=order.exchange,
-            #     orderid=order.orderid,
-            #     tradeid=d["tradeId"],
-            #     direction=order.direction,
-            #     offset=order.offset,
-            #     price=float(d["fillPx"]),
-            #     volume=trade_volume,
-            #     datetime=parse_timestamp(d["uTime"]),
-            #     gateway_name=self.gateway_name,
-            # )
-            # self.gateway.on_trade(trade)
+            # 检查是否有成交
+            if d["fillSz"] == "0":
+                return
+
+            # 将成交数量四舍五入到正确精度
+            trade_volume: float = float(d["fillSz"])
+            contract: ContractData = symbol_contract_map.get(order.symbol, None)
+            if contract:
+                trade_volume = round_to(trade_volume, contract.min_volume)
+
+            trade: TradeData = TradeData(
+                symbol=order.symbol,
+                exchange=order.exchange,
+                orderid=order.orderid,
+                tradeid=d["tradeId"],
+                direction=order.direction,
+                offset=order.offset,
+                price=float(d["fillPx"]),
+                volume=trade_volume,
+                datetime=parse_timestamp(d["uTime"]),
+                gateway_name=self.gateway_name,
+            )
+            self.gateway.on_trade(trade)
 
     def on_account(self, packet: dict) -> None:
-        """on account update"""
-
-        account: list = packet.get("data", [])
-        if len(account) == 0:
-            return None
-
-        buf: dict = account[0]
+        """资金更新推送"""
+        if len(packet["data"]) == 0:
+            return
+        buf: dict = packet["data"][0]
         for detail in buf["details"]:
             account: AccountData = AccountData(
                 accountid=detail["ccy"],
                 balance=float(detail["eq"]),
                 gateway_name=self.gateway_name,
             )
-
             account.available = float(detail["availEq"]) if len(detail["availEq"]) != 0 else 0.0
             account.frozen = account.balance - account.available
             self.gateway.on_account(account)
 
     def on_position(self, packet: dict) -> None:
-        """on position."""
-        data: list = packet.get("data", [])
+        """持仓更新推送"""
+        data: list = packet["data"]
         for d in data:
             symbol: str = d["instId"]
-            pos: float = float(d.get("pos", "0"))
+            pos: int = float(d["pos"])
             price: float = get_float_value(d, "avgPx")
             pnl: float = get_float_value(d, "upl")
 
@@ -820,58 +823,55 @@ class OkxWebsocketPrivateApi(WebsocketClient):
             self.gateway.on_position(position)
 
     def on_send_order(self, packet: dict) -> None:
-        """on send order"""
-        data: list = packet.get("data", [])
-        if packet.get("code", None) != "0":
-            if not data:
-                order: OrderData = copy(self.reqid_order_map.get(packet["id"], None))
-                if order:
-                    order.status = Status.REJECTED
-                    self.gateway.on_order(order)
-                return None
+        """委托下单回报"""
+        data: list = packet["data"]
 
-        for d in data:
-            code: str = d.get("sCode", None)
-            if code == "0":
-                return None
-
-            orderid: str = d.get("clOrdId", "")
-            if not orderid:
-                orderid: str = d.get("ordId", "")
-
-            order: OrderData = copy(self.gateway.get_order(orderid))
-            msg: str = d.get("sMsg", "")
-
-            if order:
-                order.status = Status.REJECTED
-                order.rejected_reason = msg
-                self.gateway.on_order(order)
-
-            self.gateway.write_log(f"send order failed, code: {code}, msg: {msg}")
-
-    def on_cancel_order(self, packet: dict) -> None:
-        """on cancel order."""
-        # print("on cancel the order")
-        # print(packet)
+        # 请求本身格式错误（没有委托的回报数据）
         if packet["code"] != "0":
-            code: str = packet.get("code", "")
-            msg: str = packet.get("msg", "")
-            self.gateway.write_log(f"cancel order failed, code: {code}, msg: {msg}")
-            return None
+            if not data:
+                order: OrderData = self.reqid_order_map[packet["id"]]
+                order.status = Status.REJECTED
+                self.gateway.on_order(order)
+                return
 
-        data: list = packet.get("data", [])
+        # 业务逻辑处理失败
         for d in data:
-            if d.get('sCode', "") == "0":
-                return None
+            code: str = d["sCode"]
+            if code == "0":
+                return
+
+            orderid: str = d["clOrdId"]
+            order: OrderData = self.gateway.get_order(orderid)
+            if not order:
+                return
+            order.status = Status.REJECTED
+            self.gateway.on_order(copy(order))
 
             msg: str = d["sMsg"]
-            self.gateway.write_log(f"cancel order failed, code: {d['sCode']}, msg: {msg}")
+            self.gateway.write_log(f"委托失败，状态码：{code}，信息：{msg}")
+
+    def on_cancel_order(self, packet: dict) -> None:
+        """委托撤单回报"""
+        # 请求本身的格式错误
+        if packet["code"] != "0":
+            code: str = packet["code"]
+            msg: str = packet["msg"]
+            self.gateway.write_log(f"撤单失败，状态码：{code}，信息：{msg}")
+            return
+
+        # 业务逻辑处理失败
+        data: list = packet["data"]
+        for d in data:
+            code: str = d["sCode"]
+            if code == "0":
+                return
+
+            msg: str = d["sMsg"]
+            self.gateway.write_log(f"撤单失败，状态码：{code}，信息：{msg}")
 
     def login(self) -> None:
-        """login to private websocket channel."""
-        now: float = time.time()
-        now = now - self.gateway.rest_api.time_offset_ms/1000
-        timestamp: str = str(now)
+        """用户登录"""
+        timestamp: str = str(time.time())
         msg: str = timestamp + "GET" + "/users/self/verify"
         signature: bytes = generate_signature(msg, self.secret)
 
@@ -890,7 +890,7 @@ class OkxWebsocketPrivateApi(WebsocketClient):
         self.send_packet(okx_req)
 
     def subscribe_topic(self) -> None:
-        """subscribe orders/account/positions after login success."""
+        """订阅委托、资金和持仓推送"""
         okx_req: dict = {
             "op": "subscribe",
             "args": [
@@ -910,20 +910,24 @@ class OkxWebsocketPrivateApi(WebsocketClient):
         self.send_packet(okx_req)
 
     def send_order(self, req: OrderRequest) -> str:
-        """send order"""
+        """委托下单"""
+        # 检查委托类型是否正确
         if req.type not in ORDERTYPE_VT2OKX:
-            self.gateway.write_log(f"send order failed，order type: {req.type.value} unsupported")
-            return ""
+            self.gateway.write_log(f"委托失败，不支持的委托类型：{req.type.value}")
+            return
 
+        # 检查合约代码是否正确
         contract: ContractData = symbol_contract_map.get(req.symbol, None)
         if not contract:
-            self.gateway.write_log(f"send order failed, trading symbol not found: {req.symbol}")
-            return ""
+            self.gateway.write_log(f"委托失败，找不到该合约代码{req.symbol}")
+            return
 
+        # 生成本地委托号
         self.order_count += 1
         count_str = str(self.order_count).rjust(6, "0")
         orderid = f"{self.connect_time}{count_str}"
 
+        # 生成委托请求
         args: dict = {
             "instId": req.symbol,
             "clOrdId": orderid,
@@ -946,15 +950,16 @@ class OkxWebsocketPrivateApi(WebsocketClient):
         }
         self.send_packet(okx_req)
 
+        # 推送提交中事件
         order: OrderData = req.create_order_data(orderid, self.gateway_name)
-        self.reqid_order_map[str(self.reqid)] = order
         self.gateway.on_order(order)
         return order.vt_orderid
 
     def cancel_order(self, req: CancelRequest) -> None:
-        """cancel order"""
+        """委托撤单"""
         args: dict = {"instId": req.symbol}
 
+        # 检查是否为本地委托号
         if req.orderid in local_orderids:
             args["clOrdId"] = req.orderid
         else:
@@ -975,40 +980,28 @@ def generate_signature(msg: str, secret_key: str) -> bytes:
 
 
 def generate_timestamp() -> str:
+    """生成时间戳"""
     now: datetime = datetime.utcnow()
     timestamp: str = now.isoformat("T", "milliseconds")
     return timestamp + "Z"
 
 
 def parse_timestamp(timestamp: str) -> datetime:
-    try:
-        ts = float(timestamp)
-        dt: datetime = datetime.fromtimestamp(ts / 1000)
-        return dt.replace(tzinfo=LOCAL_TZ)
-    except ValueError:
-        return datetime.now(tz=LOCAL_TZ)
+    """解析回报时间戳"""
+    dt: datetime = datetime.fromtimestamp(int(timestamp) / 1000)
+    return CHINA_TZ.localize(dt)
 
 
 def get_float_value(data: dict, key: str) -> float:
-    """utility for get float value from empty str"""
+    """获取字典中对应键的浮点数值"""
     data_str: str = data.get(key, "")
     if not data_str:
         return 0.0
-    try:
-        return float(data_str)
-    except ValueError:
-        return 0.0
-
-
-def parse_decimal(value: str) -> Decimal:
-    try:
-        return Decimal(value)
-    except decimal.InvalidOperation:
-        return Decimal("0")
+    return float(data_str)
 
 
 def parse_order_data(data: dict, gateway_name: str) -> OrderData:
-    """parse order data into OrderData"""
+    """解析委托回报数据"""
     order_id: str = data["clOrdId"]
     if order_id:
         local_orderids.add(order_id)
@@ -1018,18 +1011,15 @@ def parse_order_data(data: dict, gateway_name: str) -> OrderData:
     order: OrderData = OrderData(
         symbol=data["instId"],
         exchange=Exchange.OKX,
-        type=ORDERTYPE_OKX2VT[data.get("ordType", "limit")],
+        type=ORDERTYPE_OKX2VT[data["ordType"]],
         orderid=order_id,
         direction=DIRECTION_OKX2VT[data["side"]],
         offset=Offset.NONE,
-        traded=parse_decimal(data.get("accFillSz")),
-        price=parse_decimal(data.get("px")),
-        volume=parse_decimal(data.get("sz")),
-        traded_price=parse_decimal(data.get("avgPx")),
-        datetime=parse_timestamp(data.get("cTime")),
-        update_time=parse_timestamp(data.get("uTime")),
-        status=STATUS_OKX2VT[data.get("state", "canceled")],
+        traded=float(data["accFillSz"]),
+        price=float(data["px"]),
+        volume=float(data["sz"]),
+        datetime=parse_timestamp(data["cTime"]),
+        status=STATUS_OKX2VT[data["state"]],
         gateway_name=gateway_name,
     )
     return order
-
